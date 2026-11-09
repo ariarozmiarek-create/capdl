@@ -498,7 +498,45 @@ static void parse_bootinfo(seL4_BootInfo *bootinfo, CDL_Model *spec)
     first_arm_iospace = bootinfo->ioSpaceCaps.start;
 }
 
+/* Boot-only GOP window for TGC. The static spec cannot know the firmware's
+ * framebuffer address, so the spec carries this sentinel paddr and the loader
+ * replaces it with the GOP address from the kernel-provided BootInfo framebuffer
+ * header before the device-untyped lookup. Read-only use by TGC; not part of the
+ * signed policy path. */
+#define CDL_GOP_PLACEHOLDER_PADDR ((seL4_Word)0xF0000000UL)
+
+struct cdl_bootinfo_framebuffer {
+    uint64_t addr;
+    uint32_t pitch;
+    uint32_t width;
+    uint32_t height;
+    uint8_t  bpp;
+    uint8_t  type;
+} __attribute__((packed));
+
 #if !CONFIG_CAPDL_LOADER_STATIC_ALLOC
+/* Placeholder frames cover [CDL_GOP_PLACEHOLDER_PADDR, +CDL_GOP_PLACEHOLDER_BYTES).
+ * Each frame's paddr is the sentinel plus its offset within that window, so the
+ * window maps onto the GOP framebuffer one-to-one. */
+#define CDL_GOP_PLACEHOLDER_BYTES ((uint64_t)2 * 1024 * 1024)
+
+static seL4_Word resolve_gop_placeholder(seL4_Word paddr, int size_bits)
+{
+    uint64_t offset = (uint64_t)paddr - CDL_GOP_PLACEHOLDER_PADDR;
+    if (paddr < CDL_GOP_PLACEHOLDER_PADDR || offset >= CDL_GOP_PLACEHOLDER_BYTES) {
+        return paddr;
+    }
+    seL4_BootInfoHeader *hdr = extended_bootinfo_table[SEL4_BOOTINFO_HEADER_X86_FRAMEBUFFER];
+    ZF_LOGF_IF(hdr == NULL, "GOP placeholder frame present but BootInfo has no framebuffer header");
+    struct cdl_bootinfo_framebuffer fb;
+    memcpy(&fb, (void *)hdr + sizeof(*hdr), sizeof(fb));
+    uint64_t bytes = (uint64_t)fb.pitch * fb.height;
+    ZF_LOGF_IF(fb.addr == 0 || fb.addr > UINTPTR_MAX, "Invalid GOP framebuffer address");
+    ZF_LOGF_IF(offset + BIT(size_bits) > bytes,
+               "GOP placeholder frame exceeds framebuffer (%llu bytes)", (unsigned long long)bytes);
+    return (seL4_Word)(fb.addr + offset);
+}
+
 static int find_device_object(seL4_Word paddr, seL4_Word type, int size_bits, seL4_CPtr free_slot,
                               CDL_ObjID obj_id, seL4_BootInfo *bootinfo, CDL_Model *spec)
 {
@@ -680,7 +718,7 @@ unsigned int create_object(CDL_Model *spec, CDL_Object *obj, CDL_ObjID id, seL4_
 
 #if !CONFIG_CAPDL_LOADER_STATIC_ALLOC
     if (isDeviceObject(obj)) {
-        seL4_Word paddr = CDL_Obj_Paddr(obj);
+        seL4_Word paddr = resolve_gop_placeholder(CDL_Obj_Paddr(obj), obj_size);
         ZF_LOGD(" device frame/untyped, paddr = %p, size = %d bits", (void *) paddr, obj_size);
 
         /* This is a device object. Look for it in bootinfo. */
@@ -1965,6 +2003,7 @@ static void fill_frame_with_bootinfo(uintptr_t base, CDL_FrameFill_Element_t fra
     case CDL_FrameFill_BootInfo_X86_VBE:
     case CDL_FrameFill_BootInfo_X86_TSC_Freq:
     case CDL_FrameFill_BootInfo_FDT:
+    case CDL_FrameFill_BootInfo_X86_Framebuffer:
         break;
     default:
         ZF_LOGF("Unable to parse extra information for \"bootinfo\", given \"%d\"",
