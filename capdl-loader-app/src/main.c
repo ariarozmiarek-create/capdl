@@ -520,21 +520,33 @@ struct cdl_bootinfo_framebuffer {
  * window maps onto the GOP framebuffer one-to-one. */
 #define CDL_GOP_PLACEHOLDER_BYTES ((uint64_t)2 * 1024 * 1024)
 
-static seL4_Word resolve_gop_placeholder(seL4_Word paddr, int size_bits)
+static bool is_gop_placeholder(seL4_Word paddr)
+{
+    return paddr >= CDL_GOP_PLACEHOLDER_PADDR &&
+           (uint64_t)paddr - CDL_GOP_PLACEHOLDER_PADDR < CDL_GOP_PLACEHOLDER_BYTES;
+}
+
+/* Returns false when the window cannot be bound to the framebuffer (no BootInfo
+ * header, invalid address, or frame beyond the framebuffer). The caller then backs
+ * the frame with ordinary RAM: TGC finds no display record and skips the splash,
+ * so headless boots continue. The window never maps arbitrary memory. */
+static bool resolve_gop_placeholder(seL4_Word paddr, int size_bits, seL4_Word *resolved)
 {
     uint64_t offset = (uint64_t)paddr - CDL_GOP_PLACEHOLDER_PADDR;
-    if (paddr < CDL_GOP_PLACEHOLDER_PADDR || offset >= CDL_GOP_PLACEHOLDER_BYTES) {
-        return paddr;
-    }
     seL4_BootInfoHeader *hdr = extended_bootinfo_table[SEL4_BOOTINFO_HEADER_X86_FRAMEBUFFER];
-    ZF_LOGF_IF(hdr == NULL, "GOP placeholder frame present but BootInfo has no framebuffer header");
+    if (hdr == NULL || hdr->len < sizeof(*hdr) + sizeof(struct cdl_bootinfo_framebuffer)) {
+        ZF_LOGW("GOP placeholder: no BootInfo framebuffer header, backing with RAM");
+        return false;
+    }
     struct cdl_bootinfo_framebuffer fb;
     memcpy(&fb, (void *)hdr + sizeof(*hdr), sizeof(fb));
     uint64_t bytes = (uint64_t)fb.pitch * fb.height;
-    ZF_LOGF_IF(fb.addr == 0 || fb.addr > UINTPTR_MAX, "Invalid GOP framebuffer address");
-    ZF_LOGF_IF(offset + BIT(size_bits) > bytes,
-               "GOP placeholder frame exceeds framebuffer (%llu bytes)", (unsigned long long)bytes);
-    return (seL4_Word)(fb.addr + offset);
+    if (fb.addr == 0 || fb.addr > UINTPTR_MAX || offset + BIT(size_bits) > bytes) {
+        ZF_LOGW("GOP placeholder: framebuffer invalid or frame beyond it, backing with RAM");
+        return false;
+    }
+    *resolved = (seL4_Word)(fb.addr + offset);
+    return true;
 }
 
 static int find_device_object(seL4_Word paddr, seL4_Word type, int size_bits, seL4_CPtr free_slot,
@@ -718,7 +730,14 @@ unsigned int create_object(CDL_Model *spec, CDL_Object *obj, CDL_ObjID id, seL4_
 
 #if !CONFIG_CAPDL_LOADER_STATIC_ALLOC
     if (isDeviceObject(obj)) {
-        seL4_Word paddr = resolve_gop_placeholder(CDL_Obj_Paddr(obj), obj_size);
+        seL4_Word paddr = CDL_Obj_Paddr(obj);
+        if (is_gop_placeholder(paddr)) {
+            seL4_Word gop_paddr;
+            if (!resolve_gop_placeholder(paddr, obj_size, &gop_paddr)) {
+                return retype_untyped(free_slot, untyped_slot, obj_type, obj_size);
+            }
+            paddr = gop_paddr;
+        }
         ZF_LOGD(" device frame/untyped, paddr = %p, size = %d bits", (void *) paddr, obj_size);
 
         /* This is a device object. Look for it in bootinfo. */
