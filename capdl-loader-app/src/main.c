@@ -505,6 +505,10 @@ static void parse_bootinfo(seL4_BootInfo *bootinfo, CDL_Model *spec)
  * signed policy path. */
 #define CDL_GOP_PLACEHOLDER_PADDR ((seL4_Word)0xF0000000UL)
 
+/* Fixed page where the UEFI stub publishes the trinity_boot_display_t record.
+ * Boot-only read-only use by TGC; the frame is not in the signed policy path. */
+#define CDL_BOOT_DISPLAY_RECORD_PADDR ((seL4_Word)0xF0200000UL)
+
 struct cdl_bootinfo_framebuffer {
     uint64_t addr;
     uint32_t pitch;
@@ -732,6 +736,7 @@ unsigned int create_object(CDL_Model *spec, CDL_Object *obj, CDL_ObjID id, seL4_
     if (isDeviceObject(obj)) {
         seL4_Word paddr = CDL_Obj_Paddr(obj);
         bool gop = is_gop_placeholder(paddr);
+        bool record = paddr == CDL_BOOT_DISPLAY_RECORD_PADDR;
         if (gop) {
             seL4_Word gop_paddr;
             if (!resolve_gop_placeholder(paddr, obj_size, &gop_paddr)) {
@@ -743,9 +748,10 @@ unsigned int create_object(CDL_Model *spec, CDL_Object *obj, CDL_ObjID id, seL4_
 
         /* This is a device object. Look for it in bootinfo. */
         err = find_device_object(paddr, obj_type, obj_size, free_slot, id, info, spec);
-        if (err != seL4_NoError && gop) {
-            /* find_device_object only fails before any Retype, so RAM fallback is safe. */
-            ZF_LOGW("GOP framebuffer not in a device untyped, backing window with RAM");
+        if (err != seL4_NoError && (gop || record)) {
+            /* find_device_object only fails before any Retype, so RAM fallback is safe.
+             * A zeroed RAM page has no display magic, so TGC skips the splash. */
+            ZF_LOGW("Boot display window not in a device untyped, backing with RAM");
             return retype_untyped(free_slot, untyped_slot, obj_type, obj_size);
         }
         ZF_LOGF_IF(err != seL4_NoError, "Failed to find device frame/untyped at paddr = %p", (void *) paddr);
