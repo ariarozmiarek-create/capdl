@@ -731,7 +731,8 @@ unsigned int create_object(CDL_Model *spec, CDL_Object *obj, CDL_ObjID id, seL4_
 #if !CONFIG_CAPDL_LOADER_STATIC_ALLOC
     if (isDeviceObject(obj)) {
         seL4_Word paddr = CDL_Obj_Paddr(obj);
-        if (is_gop_placeholder(paddr)) {
+        bool gop = is_gop_placeholder(paddr);
+        if (gop) {
             seL4_Word gop_paddr;
             if (!resolve_gop_placeholder(paddr, obj_size, &gop_paddr)) {
                 return retype_untyped(free_slot, untyped_slot, obj_type, obj_size);
@@ -742,6 +743,11 @@ unsigned int create_object(CDL_Model *spec, CDL_Object *obj, CDL_ObjID id, seL4_
 
         /* This is a device object. Look for it in bootinfo. */
         err = find_device_object(paddr, obj_type, obj_size, free_slot, id, info, spec);
+        if (err != seL4_NoError && gop) {
+            /* find_device_object only fails before any Retype, so RAM fallback is safe. */
+            ZF_LOGW("GOP framebuffer not in a device untyped, backing window with RAM");
+            return retype_untyped(free_slot, untyped_slot, obj_type, obj_size);
+        }
         ZF_LOGF_IF(err != seL4_NoError, "Failed to find device frame/untyped at paddr = %p", (void *) paddr);
         return seL4_NoError;
     }
